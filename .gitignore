@@ -1,0 +1,26 @@
+__pycache__
+.idea
+.DS_Store
+*.egg-info
+build
+outputs
+dist/*
+
+# data
+data
+out
+wandb
+
+torchtitan/datasets/**/*.model
+
+# temp files
+*.log
+error.json
+_remote_module_non_scriptable.py
+
+# local environment, data and tokenizer (not part of the code)
+.venv/
+torchtitan/datasets/c4_mini/
+torchtitan/datasets/tokenizer/llama2/
+torchtitan/datasets/tokenizer/*.json
+*.tmp

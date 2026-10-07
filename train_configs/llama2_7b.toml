@@ -1,0 +1,69 @@
+# torchtitan Config.toml
+# NOTE: this toml config is a preset for 64 A100 GPUs.
+
+[job]
+dump_folder = "./outputs"
+description = "Llama2 7B training"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 1
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_color_printing = false
+enable_wandb = true
+wandb_comment =  ""
+
+[model]
+name = "llama2"
+flavor = "7B"
+norm_type = "fused_rmsnorm"  # [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]
+tokenizer_path = "path/tokenizer.model"
+# hyper-connections: none, mhc, mhc_lite, identity, identity_tanh_offdiag
+hyper_conn_type = "none"
+hyper_conn_n = 4  # number of residual streams
+hyper_conn_reduce_mode = "sum"  # sum, mean, 4mean
+mhc_h_res_offdiag_init_scale = 0.05  # identity_tanh_offdiag: initial gamma
+mhc_h_res_offdiag_fixed = false  # identity_tanh_offdiag: gamma is trainable unless true
+
+[optimizer]
+name = "adam_mini" #"AdamW" 
+lr = 3e-4  # peak lr (Llama 2 7B)
+
+[training]
+batch_size = 2 #total_bs = grad_accumulation_steps * batch_size * num_gpus
+seq_len = 2048 
+warmup_steps = 500  # lr scheduler warm up (5% of the train steps)
+lr_schedule = "cosine"  # linear (to 0) or cosine (to lr_min_ratio * lr)
+lr_min_ratio = 0.1  # min lr = 3e-5
+max_norm = 1.0  # grad norm clipping
+steps =  10000
+data_parallel_degree = -1
+tensor_parallel_degree = 1
+fp8_linear = ""
+compile = false
+dataset = "my_c4" #"c4"
+dataset_path = "path/c4" # "./torchtitan/datasets/c4_mini/"
+grad_accumulation_steps =  1  #  total_bs = grad_accumulation_steps * batch_size * num_gpus
+
+
+
+[experimental]
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = false
+folder = "path/llama2_7B" 
+interval_type = "steps"
+interval = 50000000
+model_weights_only = false
+export_dtype = "float32"
+async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+
+[activation_checkpoint]
+mode = 'selective'  # ['none', 'selective', 'full'] # hyper-connections keep n_streams x larger residuals, 'none' may OOM
+selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
