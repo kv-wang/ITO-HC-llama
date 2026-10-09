@@ -7,6 +7,7 @@
 import contextlib
 import gc
 import os
+import random
 import time
 
 from dataclasses import dataclass, field
@@ -406,6 +407,12 @@ def main(job_config: JobConfig):
         # If PP is enabled, we can't rely on init_weights, because some layers are missing.
         # In the future, we may make init_weights handle missing layers, but also have to consider RNG seed propagation.
         # allocate sharded model on GPU and initialize weights via DTensor
+        # seed right before init so nothing else consumes the RNG in between
+        seed = job_config.training.seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)  # seeds the CPU and all CUDA generators
+        logger.info(f"Initializing model weights with seed {seed}")
         whole_model.init_weights()
 
     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()

@@ -12,7 +12,7 @@ profile_freq = 100
 
 [metrics]
 log_freq = 1
-enable_tensorboard = true
+enable_tensorboard = false  # wandb logs the same metrics; tb writes to network storage can fail with I/O errors
 save_tb_folder = "tb"
 enable_color_printing = false
 enable_wandb = true
@@ -42,6 +42,7 @@ lr_schedule = "cosine"  # linear (to 0) or cosine (to lr_min_ratio * lr)
 lr_min_ratio = 0.1  # min lr = 3e-5
 max_norm = 1.0  # grad norm clipping
 steps =  10000
+seed = 42  # model init seed: same backbone init for every hyper-connection type
 data_parallel_degree = -1
 tensor_parallel_degree = 1
 fp8_linear = ""

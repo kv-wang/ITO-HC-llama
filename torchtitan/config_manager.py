@@ -453,6 +453,16 @@ class JobConfig:
             default=50,
             help="Python garbage control scheduling interval, in steps",
         )
+        self.parser.add_argument(
+            "--training.seed",
+            type=int,
+            default=42,
+            help="""
+                Random seed for model initialization. With the same seed, every
+                hyper-connection type gets the same backbone weights, since the
+                hyper-connection parameters are initialized to constants.
+            """,
+        )
 
         # checkpointing configs
         self.parser.add_argument(

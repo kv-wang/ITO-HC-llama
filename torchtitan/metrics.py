@@ -100,14 +100,31 @@ class MetricLogger:
             self.writer = SummaryWriter(log_dir, max_queue=1000)
 
     def log(self, metrics: Dict[str, Any], step: int):
-        if self.writer is not None:
+        if self.writer is None:
+            return
+        # A failed write (e.g. a transient I/O error on a network filesystem) must not
+        # kill training. The TensorBoard background writer cannot recover after an
+        # error, so stop logging to it and keep training.
+        try:
             for k, v in metrics.items():
                 tag = k if self.tag is None else f"{self.tag}/{k}"
                 self.writer.add_scalar(tag, v, step)
+        except Exception as e:
+            logger.warning(
+                f"TensorBoard logging failed at step {step}, disabling it for the rest of the run: {e!r}"
+            )
+            self._close_writer()
+
+    def _close_writer(self):
+        writer, self.writer = self.writer, None
+        try:
+            writer.close()
+        except Exception as e:
+            logger.warning(f"Closing the TensorBoard writer failed: {e!r}")
 
     def close(self):
         if self.writer is not None:
-            self.writer.close()
+            self._close_writer()
 
 
 def build_metric_logger(

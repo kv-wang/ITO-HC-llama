@@ -194,6 +194,26 @@ class TestTransformerWithHyperConn(unittest.TestCase):
                 for name, g in grads["rmsnorm"].items():
                     torch.testing.assert_close(grads["fused_rmsnorm"][name], g, atol=1e-4, rtol=1e-3, msg=name)
 
+    def test_seed_gives_same_backbone_for_all_methods(self):
+        # same path as train.py: meta build -> to_empty -> seed -> init_weights
+        def seeded_init(hc_type, seed):
+            with torch.device("meta"):
+                model = Transformer(small_args(hc_type))
+            model.to_empty(device=DEVICE)
+            torch.manual_seed(seed)
+            model.init_weights()
+            return {k: v for k, v in model.state_dict().items() if not is_hyper_conn_param(k)}
+
+        ref = seeded_init("none", 42)
+        for hc_type in HC_TYPES + ("none",):
+            with self.subTest(hc_type=hc_type):
+                sd = seeded_init(hc_type, 42)
+                self.assertEqual(sd.keys(), ref.keys())
+                for k in ref:
+                    torch.testing.assert_close(sd[k], ref[k], atol=0, rtol=0, msg=k)
+        other = seeded_init("mhc", 43)
+        self.assertFalse(torch.equal(other["tok_embeddings.weight"], ref["tok_embeddings.weight"]))
+
     def test_single_stream_runs(self):
         # with one stream, H_pre / H_post reduce to per-token scalar gates
         model = build_model("identity", hyper_conn_n=1)
