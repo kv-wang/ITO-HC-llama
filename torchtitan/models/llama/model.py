@@ -17,7 +17,7 @@ from torch import nn
 from torchtitan.models.llama.hyper_conn import (
     expand_streams,
     HYPER_CONN_TYPES,
-    HyperConnection,
+    build_hyper_connection,
     reduce_streams,
     REDUCE_STREAM_MODES,
 )
@@ -43,7 +43,7 @@ class ModelArgs:
     depth_init: bool = True
     norm_type: str = "rmsnorm"
 
-    # hyper-connections: none, mhc, mhc_lite, identity, identity_tanh_offdiag
+    # hyper-connections: none, hc, mhc, mhc_lite, identity, identity_tanh_offdiag
     hyper_conn_type: str = "none"
     hyper_conn_n: int = 4  # number of residual streams
     hyper_conn_reduce_mode: str = "sum"  # sum, mean, 4mean
@@ -332,8 +332,8 @@ class TransformerBlock(nn.Module):
                 offdiag_init_scale=model_args.mhc_h_res_offdiag_init_scale,
                 offdiag_trainable=model_args.mhc_h_res_offdiag_trainable,
             )
-            self.hc_attn = HyperConnection(layer_index=2 * layer_id, **hc_kwargs)
-            self.hc_ffn = HyperConnection(layer_index=2 * layer_id + 1, **hc_kwargs)
+            self.hc_attn = build_hyper_connection(layer_index=2 * layer_id, **hc_kwargs)
+            self.hc_ffn = build_hyper_connection(layer_index=2 * layer_id + 1, **hc_kwargs)
 
     def forward(
         self,

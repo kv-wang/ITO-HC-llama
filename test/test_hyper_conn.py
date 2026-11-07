@@ -1,18 +1,36 @@
+import os
+import sys
 import unittest
 
 import torch
 import torch.nn.functional as F
 
 from torchtitan.models.llama.hyper_conn import (
+    build_hyper_connection,
     HyperConnection,
     is_hyper_conn_param,
+    OriginalHyperConnection,
     permutation_matrices,
     sinkhorn_knopps,
 )
 from torchtitan.models.llama.model import ModelArgs, Transformer
 
-HC_TYPES = ("mhc", "mhc_lite", "identity", "identity_tanh_offdiag")
+MHC_TYPES = ("mhc", "mhc_lite", "identity", "identity_tanh_offdiag")
+HC_TYPES = ("hc",) + MHC_TYPES
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# reference implementation of "hc" (MHC-lite-exploration/hyper_conn/hyper_connections.py)
+MHC_LITE_DIR = os.environ.get(
+    "MHC_LITE_EXPLORATION_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "..", "MHC-lite-exploration"),
+)
+
+
+def dynamic_and_static_params(hc):
+    """(dynamic projection, static H_pre logits) of an HC module, for grad / update checks."""
+    if isinstance(hc, OriginalHyperConnection):
+        return hc.dynamic_alpha_fn, hc.static_alpha
+    return hc.dynamic_fn, hc.static_alpha_pre
 
 
 def small_args(hyper_conn_type, **kwargs):
@@ -88,7 +106,7 @@ class TestHResConstraints(unittest.TestCase):
         return h
 
     def test_init_is_near_identity(self):
-        for hc_type in HC_TYPES:
+        for hc_type in MHC_TYPES:
             with self.subTest(hc_type=hc_type):
                 h = self._h_res_matrix(self._hc(hc_type))
                 # off-identity logits start at -8: mhc_lite keeps ~23 * e^-8 of the mass off I
@@ -139,6 +157,92 @@ class TestHResConstraints(unittest.TestCase):
         torch.testing.assert_close(delta, 2 * pre.view(1, 1, 4, 1) * out.unsqueeze(-2), atol=1e-5, rtol=1e-5)
 
 
+class TestOriginalHyperConnection(unittest.TestCase):
+    def _hc(self, n=4, dim=16, layer_index=1):
+        torch.manual_seed(0)
+        hc = build_hyper_connection("hc", num_streams=n, dim=dim, layer_index=layer_index)
+        self.assertIsInstance(hc, OriginalHyperConnection)
+        hc.init_weights()
+        return hc
+
+    def test_mhc_class_rejects_hc(self):
+        with self.assertRaises(ValueError):
+            HyperConnection("hc", num_streams=4, dim=16, layer_index=0)
+
+    def test_init(self):
+        # zero dynamic projections: H_pre = one-hot(layer_index % n), H_res = I, H_post = 1
+        hc = self._hc(layer_index=5)  # stream 1
+        x = torch.randn(2, 3, 4, 16)
+        out = torch.randn(2, 3, 16)
+        branch_input, add_residual = hc(x)
+        torch.testing.assert_close(branch_input, x[..., 1, :])
+        torch.testing.assert_close(add_residual(out), x + out.unsqueeze(-2))
+
+    def test_forward_matches_formula(self):
+        hc = self._hc()
+        perturb_(hc)
+        x = torch.randn(2, 3, 4, 16)
+        out = torch.randn(2, 3, 16)
+        normed = F.normalize(x, dim=-1) * 16**0.5 * (hc.norm.gamma + 1)
+        alpha = hc.static_alpha + hc.dynamic_alpha_scale * torch.tanh(normed @ hc.dynamic_alpha_fn)
+        beta = hc.static_beta + hc.dynamic_beta_scale * torch.tanh(normed @ hc.dynamic_beta_fn)
+        self.assertEqual(alpha.shape, (2, 3, 4, 5))
+        branch_input, add_residual = hc(x)
+        torch.testing.assert_close(branch_input, torch.einsum("bts,btsd->btd", alpha[..., 0], x))
+        expected = torch.einsum("btsu,btsd->btud", alpha[..., 1:], x) + beta[..., None] * out[:, :, None]
+        torch.testing.assert_close(add_residual(out), expected)
+
+    def test_matches_reference_implementation(self):
+        try:
+            sys.path.insert(0, os.path.join(MHC_LITE_DIR, "hyper_conn"))
+            from hyper_connections import HyperConnections
+        except ImportError as e:
+            self.skipTest(f"reference HyperConnections not importable from {MHC_LITE_DIR}: {e}")
+        finally:
+            sys.path.pop(0)
+        # fp32: OriginalHyperConnection computes its coefficients in fp32
+        n, dim, b, t = 4, 16, 2, 3
+        for layer_index in range(n):
+            with self.subTest(layer_index=layer_index):
+                ref = HyperConnections(n, dim=dim, layer_index=layer_index)
+                ours = self._hc(n, dim, layer_index)
+                # identical init (scalars are () in the reference, (1,) here)
+                ref_sd = ref.state_dict()
+                for k, v in ours.state_dict().items():
+                    torch.testing.assert_close(v, ref_sd[k].reshape(v.shape), msg=k)
+                perturb_(ref)
+                with torch.no_grad():
+                    for k, v in ours.state_dict().items():
+                        v.copy_(ref.state_dict()[k].reshape(v.shape))
+
+                x = torch.randn(b, t, n, dim)
+                out = torch.randn(b, t, dim)
+                # reference layout: (b * s, t, d)
+                x_ref = x.detach().permute(0, 2, 1, 3).reshape(b * n, t, dim).requires_grad_()
+                x_ours = x.detach().clone().requires_grad_()
+                out_ref = out.detach().clone().requires_grad_()
+                out_ours = out.detach().clone().requires_grad_()
+
+                branch_ref, add_ref = ref(x_ref)
+                branch_ours, add_ours = ours(x_ours)
+                torch.testing.assert_close(branch_ours, branch_ref)
+                y_ref = add_ref(out_ref).reshape(b, n, t, dim).permute(0, 2, 1, 3)
+                y_ours = add_ours(out_ours)
+                torch.testing.assert_close(y_ours, y_ref)
+
+                # gradients through branch input and residual output
+                w1, w2 = torch.randn_like(branch_ours), torch.randn_like(y_ours)
+                ((branch_ref * w1).sum() + (y_ref * w2).sum()).backward()
+                ((branch_ours * w1).sum() + (y_ours * w2).sum()).backward()
+                torch.testing.assert_close(
+                    x_ours.grad, x_ref.grad.reshape(b, n, t, dim).permute(0, 2, 1, 3)
+                )
+                torch.testing.assert_close(out_ours.grad, out_ref.grad)
+                ref_params = dict(ref.named_parameters())
+                for k, p in ours.named_parameters():
+                    torch.testing.assert_close(p.grad, ref_params[k].grad.reshape(p.shape), msg=k)
+
+
 class TestTransformerWithHyperConn(unittest.TestCase):
     def test_baseline_has_no_hc_params(self):
         model = build_model("none")
@@ -174,8 +278,9 @@ class TestTransformerWithHyperConn(unittest.TestCase):
                     self.assertIsNotNone(p.grad, name)
                     self.assertTrue(torch.isfinite(p.grad).all(), name)
                 for layer in model.layers.values():
-                    self.assertGreater(layer.hc_attn.dynamic_fn.grad.abs().sum().item(), 0)
-                    self.assertGreater(layer.hc_attn.static_alpha_pre.grad.abs().sum().item(), 0)
+                    dynamic, static = dynamic_and_static_params(layer.hc_attn)
+                    self.assertGreater(dynamic.grad.abs().sum().item(), 0)
+                    self.assertGreater(static.grad.abs().sum().item(), 0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused_rmsnorm needs CUDA")
     def test_fused_rmsnorm_matches_rmsnorm(self):
@@ -216,9 +321,11 @@ class TestTransformerWithHyperConn(unittest.TestCase):
 
     def test_single_stream_runs(self):
         # with one stream, H_pre / H_post reduce to per-token scalar gates
-        model = build_model("identity", hyper_conn_n=1)
         tokens = torch.randint(0, 128, (2, 32), device=DEVICE)
-        self.assertEqual(model(tokens).shape, (2, 32, 128))
+        for hc_type in ("identity", "hc"):
+            with self.subTest(hc_type=hc_type):
+                model = build_model(hc_type, hyper_conn_n=1)
+                self.assertEqual(model(tokens).shape, (2, 32, 128))
 
     def test_adam_mini_training_reduces_loss(self):
         try:
@@ -256,9 +363,9 @@ class TestTransformerWithHyperConn(unittest.TestCase):
                     losses.append(loss.item())
                 self.assertLess(losses[-1], losses[0] - 1.0, losses)
                 # HC params were updated by per-coordinate Adam
-                hc = model.layers["0"].hc_attn
-                self.assertIn("v", opt.state[hc.dynamic_fn])
-                self.assertGreater(hc.dynamic_fn.abs().sum().item(), 0)
+                dynamic, _ = dynamic_and_static_params(model.layers["0"].hc_attn)
+                self.assertIn("v", opt.state[dynamic])
+                self.assertGreater(dynamic.abs().sum().item(), 0)
 
 
 if __name__ == "__main__":

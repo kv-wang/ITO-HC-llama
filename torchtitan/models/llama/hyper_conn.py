@@ -1,8 +1,11 @@
 # Hyper-connection residual streams for the Llama model.
 #
-# Ported from MHC-lite-exploration (hyper_conn/mhc.py and hyper_conn/mhc_lite.py),
-# keeping only the pieces needed for these variants (num_fracs = 1, one input view):
+# Ported from MHC-lite-exploration (hyper_conn/hyper_connections.py, hyper_conn/mhc.py and
+# hyper_conn/mhc_lite.py), keeping only the pieces needed for these variants
+# (num_fracs = 1, one input view):
 #
+#   hc                     original Hyper-Connections (OriginalHyperConnection): H_pre, H_res, H_post
+#                          = static + scale * tanh(dynamic), unconstrained
 #   mhc                    H_res = Sinkhorn(static + dynamic logits)            (doubly stochastic)
 #   mhc_lite               H_res = sum_r softmax(static + dynamic)_r * P_r      (convex comb. of n! permutations)
 #   identity               H_res = I                                            (H_pre / H_post still learned)
@@ -28,7 +31,9 @@ try:
 except ImportError:  # older torch
     from torch.distributed._tensor import distribute_tensor, DTensor
 
-HYPER_CONN_TYPES = ("none", "mhc", "mhc_lite", "identity", "identity_tanh_offdiag")
+# variants implemented by HyperConnection (mHC family); "hc" is OriginalHyperConnection
+MHC_TYPES = ("mhc", "mhc_lite", "identity", "identity_tanh_offdiag")
+HYPER_CONN_TYPES = ("none", "hc") + MHC_TYPES
 REDUCE_STREAM_MODES = ("sum", "mean", "4mean")
 GATE_FNS = ("sigmoid", "softmax")
 
@@ -141,8 +146,8 @@ class HyperConnection(nn.Module):
         offdiag_trainable: bool = True,
     ):
         super().__init__()
-        if hyper_conn_type not in HYPER_CONN_TYPES or hyper_conn_type == "none":
-            raise ValueError(f"Invalid hyper_conn_type: {hyper_conn_type}")
+        if hyper_conn_type not in MHC_TYPES:
+            raise ValueError(f"Invalid hyper_conn_type for HyperConnection: {hyper_conn_type}")
         if gate_fn not in GATE_FNS:
             raise ValueError(f"Invalid mhc_gate_fn: {gate_fn}")
         if num_streams < 1:
@@ -283,3 +288,99 @@ class HyperConnection(nn.Module):
             return mixed + h_post * branch_output.unsqueeze(-2)
 
         return branch_input, add_residual
+
+
+class OriginalHyperConnection(nn.Module):
+    """Original Hyper-Connections (https://arxiv.org/abs/2409.19606, Appendix J, Algorithm 2).
+
+    Port of ``HyperConnections`` in MHC-lite-exploration/hyper_conn/hyper_connections.py
+    (``--hyper_conn_type=hc``) with its defaults: tanh=True, num_fracs=1, num_input_views=1,
+    dropout=0, add_branch_out_to_residual=True. Parameter names match the reference.
+
+    With normed[s] = RMSNorm(x[s]) applied per stream over ``dim``:
+        alpha[s, :] = static_alpha[s, :] + dynamic_alpha_scale * tanh(normed[s] @ dynamic_alpha_fn)
+        beta[s]     = static_beta[s]     + dynamic_beta_scale  * tanh(normed[s] @ dynamic_beta_fn)
+        branch_input = sum_s alpha[s, 0]     * x[s]           (H_pre)
+        x'[t]        = sum_s alpha[s, 1 + t] * x[s]           (H_res, unconstrained)
+                       + beta[t] * f(branch_input)            (H_post)
+    Init: static_alpha = [one-hot(init_residual_index) | I], static_beta = 1, dynamic
+    projections = 0, dynamic scales = 1e-2.
+
+    Differences from the reference that do not change the math: the residual layout is
+    (b, t, s, d) instead of (b * s, t, d); the scalar scales have shape (1,) instead of ()
+    (FSDP shards dim 0); the coefficients are computed in fp32 as in HyperConnection; and the
+    init stream is ``layer_index % n`` (the GPT reference passes no layer index and so
+    picks a random stream per module).
+    """
+
+    def __init__(self, num_streams: int, dim: int, layer_index: int):
+        super().__init__()
+        if num_streams < 1:
+            raise ValueError("hyper_conn_n must be >= 1")
+        n = num_streams
+        self.hyper_conn_type = "hc"
+        self.num_streams = n
+        self.init_residual_index = layer_index % n
+
+        self.norm = HCRMSNorm(dim)  # per stream, over dim
+
+        # width connection: column 0 -> branch input, columns 1..n -> residual streams
+        self.static_alpha = nn.Parameter(torch.empty(n, n + 1))
+        self.dynamic_alpha_fn = nn.Parameter(torch.empty(dim, n + 1))
+        self.dynamic_alpha_scale = nn.Parameter(torch.empty(1))
+
+        # depth connection: weight of the branch output added to each stream
+        self.static_beta = nn.Parameter(torch.empty(n))
+        self.dynamic_beta_fn = nn.Parameter(torch.empty(dim))
+        self.dynamic_beta_scale = nn.Parameter(torch.empty(1))
+
+    def init_weights(self):
+        n = self.num_streams
+        self.norm.init_weights()
+
+        static_alpha = torch.zeros(n, n + 1)
+        static_alpha[self.init_residual_index, 0] = 1.0
+        static_alpha[:, 1:] = torch.eye(n)
+        _copy_init(self.static_alpha, static_alpha)
+        _copy_init(self.dynamic_alpha_fn, torch.zeros(self.dynamic_alpha_fn.shape))
+        _copy_init(self.dynamic_alpha_scale, torch.full((1,), 1e-2))
+
+        _copy_init(self.static_beta, torch.ones(n))
+        _copy_init(self.dynamic_beta_fn, torch.zeros(self.dynamic_beta_fn.shape))
+        _copy_init(self.dynamic_beta_scale, torch.full((1,), 1e-2))
+
+    def coefficients(self, residuals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """alpha (b, t, s, 1 + s) and beta (b, t, s) in fp32 for residuals (b, t, s, d)."""
+        normed = self.norm(residuals)
+        alpha = self.static_alpha.float() + self.dynamic_alpha_scale.float() * torch.tanh(
+            (normed @ self.dynamic_alpha_fn).float()
+        )
+        beta = self.static_beta.float() + self.dynamic_beta_scale.float() * torch.tanh(
+            (normed @ self.dynamic_beta_fn).float()
+        )
+        return alpha, beta
+
+    def forward(
+        self, residuals: torch.Tensor
+    ) -> Tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]:
+        """Same interface as HyperConnection.forward."""
+        dtype = residuals.dtype
+        alpha, beta = self.coefficients(residuals)
+
+        mix = torch.einsum("...st,...sd->...td", alpha.to(dtype), residuals)
+        branch_input, mixed = mix[..., 0, :], mix[..., 1:, :]
+        beta = beta.to(dtype).unsqueeze(-1)
+
+        def add_residual(branch_output: torch.Tensor) -> torch.Tensor:
+            return mixed + beta * branch_output.unsqueeze(-2)
+
+        return branch_input, add_residual
+
+
+def build_hyper_connection(
+    hyper_conn_type: str, num_streams: int, dim: int, layer_index: int, **mhc_kwargs
+) -> nn.Module:
+    """Hyper-connection module for one sublayer; ``mhc_kwargs`` are ignored for "hc"."""
+    if hyper_conn_type == "hc":
+        return OriginalHyperConnection(num_streams, dim, layer_index)
+    return HyperConnection(hyper_conn_type, num_streams, dim, layer_index, **mhc_kwargs)
