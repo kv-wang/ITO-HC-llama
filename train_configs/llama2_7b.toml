@@ -23,7 +23,7 @@ name = "llama2"
 flavor = "7B"
 norm_type = "fused_rmsnorm"  # [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]
 tokenizer_path = "path/tokenizer.model"
-# hyper-connections: none, mhc, mhc_lite, identity, identity_tanh_offdiag
+# hyper-connections: none, hc, mhc, mhc_lite, identity, identity_tanh_offdiag
 hyper_conn_type = "none"
 hyper_conn_n = 4  # number of residual streams
 hyper_conn_reduce_mode = "sum"  # sum, mean, 4mean

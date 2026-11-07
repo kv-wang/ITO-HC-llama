@@ -188,9 +188,10 @@ class JobConfig:
             "--model.hyper_conn_type",
             type=str,
             default="none",
-            choices=["none", "mhc", "mhc_lite", "identity", "identity_tanh_offdiag"],
+            choices=["none", "hc", "mhc", "mhc_lite", "identity", "identity_tanh_offdiag"],
             help="""
                 Hyper-connection residual type.
+                hc: original hyper-connections (unconstrained static + tanh dynamic H_pre / H_res / H_post);
                 mhc: sinkhorn H_res; mhc_lite: convex combination of permutations;
                 identity: H_res fixed to I; identity_tanh_offdiag: H_res = I + gamma * tanh(offdiag)
             """,
@@ -231,6 +232,12 @@ class JobConfig:
             "--model.mhc_h_res_offdiag_fixed",
             action="store_true",
             help="identity_tanh_offdiag: keep gamma fixed (gamma is trainable by default)",
+        )
+        self.parser.add_argument(
+            "--model.save_h_res_freq",
+            type=int,
+            default=0,
+            help="Save H_res matrices every N steps (0 to disable). Only for identity_tanh_offdiag.",
         )
 
         # optimizer configs
@@ -302,6 +309,15 @@ class JobConfig:
             help="How many train steps to run",
         )
         self.parser.add_argument(
+            "--training.stop_step",
+            type=int,
+            default=0,
+            help="""
+                Stop cleanly after this step while keeping the lr schedule of --training.steps
+                (e.g. a short run of a long config). 0 means run all --training.steps.
+            """,
+        )
+        self.parser.add_argument(
             "--training.grad_accumulation_steps",
             type=int,
             default=1,
@@ -318,6 +334,24 @@ class JobConfig:
             type=int,
             default=100,
             help="Iteration interval for calculating validation loss",
+        )
+        self.parser.add_argument(
+            "--training.val_batch_size",
+            type=int,
+            default=0,
+            help="Batch size for calculating validation loss, 0 means --training.batch_size",
+        )
+        self.parser.add_argument(
+            "--training.emulate_dp_degree",
+            type=int,
+            default=1,
+            help="""
+                Feed the training data and shard the validation data as a run with this many
+                data-parallel ranks would, also on fewer GPUs. Each GPU takes the data of
+                emulate_dp_degree / dp_degree virtual ranks and alternates between them over the
+                grad accumulation micro-batches, so every step averages the same sequences as
+                the multi-GPU run. Must be a multiple of the data parallel degree. 1 means disabled.
+            """,
         )
         self.parser.add_argument(
             "--training.data_parallel_degree",

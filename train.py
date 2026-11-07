@@ -66,6 +66,32 @@ import torch_optimizer as optim
 import wandb
 
 
+def _full(t):
+    """Gather a (possibly FSDP-sharded DTensor) tensor; collective, so call on every rank."""
+    return t.full_tensor() if hasattr(t, "full_tensor") else t
+
+
+@torch.no_grad()
+def collect_h_res(model):
+    """identity_tanh_offdiag: per-layer gamma and the H_res used in forward.
+
+    Returns {"layer_{i}_{attn|ffn}": (gamma, H_res (n, n) fp32 cpu)}. Every rank must call it.
+    """
+    out = {}
+    for layer_id, layer in model.layers.items():
+        for kind in ("attn", "ffn"):
+            hc = getattr(layer, f"hc_{kind}", None)
+            if hc is None or hc.hyper_conn_type != "identity_tanh_offdiag":
+                continue
+            logits = _full(hc.static_alpha_res).float()
+            gamma = _full(hc.h_res_offdiag_log_scale).float().exp()
+            eye = torch.eye(hc.num_streams, device=logits.device)
+            # same formula as HyperConnection.h_res_static
+            h_res = eye + gamma * (1.0 - eye) * logits.tanh()
+            out[f"layer_{layer_id}_{kind}"] = (gamma.item(), h_res.cpu())
+    return out
+
+
 @dataclass
 class TrainState(Stateful):
     step: int = 0
@@ -222,27 +248,31 @@ def build_optimizers(model_parts, job_config: JobConfig, world_mesh=None):
 
 
 
-def validate(job_config, model, data_loader_val, loss_fn, current_step, dp_mesh=None):
+def validate(job_config, model, data_loaders_val, loss_fn, current_step, dp_mesh=None):
+    """data_loaders_val: one loader per data-parallel rank fed by this GPU"""
     model.eval()
-    loss_list = []
+    rank_losses = []
     total_tokens = 0
     num_val_batch = job_config.training.num_val_batch # limit the number of data for validation
-    current_batch_idx = 0
     logger.info(f"Calculating validation loss...")
     with torch.no_grad():
-        for batch in data_loader_val:
-            current_batch_idx  += 1
-            if current_batch_idx > num_val_batch:
-                break
-            input_ids, labels = batch
-            input_ids = input_ids.cuda()
-            labels = labels.cuda()
-            pred = model(input_ids)
-            loss = loss_fn(pred, labels)
-            loss_list.append( loss.item() )
-            total_tokens += labels.numel()
+        for data_loader_val in data_loaders_val:
+            loss_list = []
+            current_batch_idx = 0
+            for batch in data_loader_val:
+                current_batch_idx  += 1
+                if current_batch_idx > num_val_batch:
+                    break
+                input_ids, labels = batch
+                input_ids = input_ids.cuda()
+                labels = labels.cuda()
+                pred = model(input_ids)
+                loss = loss_fn(pred, labels)
+                loss_list.append( loss.item() )
+                total_tokens += labels.numel()
+            rank_losses.append(np.mean(loss_list))
 
-    avg_loss = np.mean(loss_list)
+    avg_loss = np.mean(rank_losses)
     # average over data-parallel ranks (each rank evaluates its own shard of the val data)
     if dp_mesh is not None:
         avg_loss = dist_mean(avg_loss, dp_mesh).item()
@@ -300,6 +330,29 @@ def main(job_config: JobConfig):
     tokenizer_type = model_name_to_tokenizer[model_name]
     tokenizer = create_tokenizer(tokenizer_type, job_config.model.tokenizer_path)
 
+    # the data is split as for data_dp_degree data-parallel ranks; with --training.emulate_dp_degree
+    # each GPU feeds several of these ranks, so runs on fewer GPUs see the same data
+    data_dp_degree = job_config.training.emulate_dp_degree
+    if data_dp_degree == 1:
+        data_dp_degree = dp_degree
+    if data_dp_degree % dp_degree != 0:
+        raise ValueError(
+            f"--training.emulate_dp_degree ({data_dp_degree}) must be a multiple of "
+            f"the data parallel degree ({dp_degree})"
+        )
+    ranks_per_gpu = data_dp_degree // dp_degree
+    if job_config.training.grad_accumulation_steps % ranks_per_gpu != 0:
+        raise ValueError(
+            f"--training.grad_accumulation_steps ({job_config.training.grad_accumulation_steps}) "
+            f"must be a multiple of the data-parallel ranks per GPU ({ranks_per_gpu})"
+        )
+    data_ranks = [dp_rank * ranks_per_gpu + i for i in range(ranks_per_gpu)]
+    if ranks_per_gpu > 1:
+        logger.info(
+            f"Emulating the data of {data_dp_degree} data-parallel ranks, "
+            f"this GPU feeds ranks {data_ranks}"
+        )
+
     # build dataloader
     data_loader = build_hf_data_loader(
         job_config.training.dataset,
@@ -307,21 +360,25 @@ def main(job_config: JobConfig):
         tokenizer,
         job_config.training.batch_size,
         job_config.training.seq_len,
-        dp_degree,
+        data_dp_degree,
         dp_rank,
+        virtual_ranks=data_ranks,
     )
 
-    # validation dataloader use c4 mini
-
-    data_loader_val = build_hf_data_loader(
-        "c4_mini",
-        "./torchtitan/datasets/c4_mini/",
-        tokenizer,
-        job_config.training.batch_size,
-        job_config.training.seq_len,
-        dp_degree,
-        dp_rank,
-    )
+    # validation dataloader use c4 mini, one per data-parallel rank fed by this GPU
+    data_loaders_val = [
+        build_hf_data_loader(
+            "c4_mini",
+            "./torchtitan/datasets/c4_mini/",
+            tokenizer,
+            job_config.training.val_batch_size or job_config.training.batch_size,
+            job_config.training.seq_len,
+            data_dp_degree,
+            dp_rank,
+            virtual_ranks=[r],
+        )
+        for r in data_ranks
+    ]
 
     # loss_parallel enables dispatching to efficient loss operators
     loss_parallel_ctx = (
@@ -434,7 +491,8 @@ def main(job_config: JobConfig):
     if job_config.metrics.enable_wandb and global_rank == 0:
         # if torch.distributed.get_rank() == 0 
         logger.info("Initializing wandb")
-        run_id = job_config.model.name + job_config.model.flavor + job_config.optimizer.name + str(job_config.optimizer.lr) + hc_tag + job_config.metrics.wandb_comment
+        # world_size: number of GPUs actually used (one per process), whatever data split is emulated
+        run_id = job_config.model.name + job_config.model.flavor + job_config.optimizer.name + str(job_config.optimizer.lr) + hc_tag + f"_{world_size}gpu" + job_config.metrics.wandb_comment
         wandb.init(project=job_config.job.description, name= run_id)
 
 
@@ -446,6 +504,15 @@ def main(job_config: JobConfig):
 
     # load initial checkpoint
     job_config.checkpoint.folder +=  f"/{job_config.model.name}_{job_config.model.flavor}/{job_config.optimizer.name}{hc_tag}"
+
+    # identity_tanh_offdiag: H_res of every layer saved every --model.save_h_res_freq steps
+    log_h_res = model_config.hyper_conn_type == "identity_tanh_offdiag"
+    h_res_save_dir = None
+    if log_h_res and job_config.model.save_h_res_freq > 0:
+        h_res_save_dir = os.path.join(job_config.job.dump_folder, job_config.checkpoint.folder, "h_res")
+        if global_rank == 0:
+            os.makedirs(h_res_save_dir, exist_ok=True)
+        logger.info(f"Saving H_res every {job_config.model.save_h_res_freq} steps to {h_res_save_dir}")
     
     checkpoint = CheckpointManager(
         model_parts=model_parts,
@@ -502,14 +569,17 @@ def main(job_config: JobConfig):
     ) as torch_profiler, maybe_enable_memory_snapshot(
         job_config, global_step=train_state.step
     ) as memory_profiler:
-        while train_state.step < job_config.training.steps:
+        last_step = job_config.training.steps
+        if job_config.training.stop_step > 0:
+            last_step = min(last_step, job_config.training.stop_step)
+        while train_state.step < last_step:
             train_state.step += 1
             if train_state.step > 1 and train_state.step % _gc_freq == 0:
                 gc.collect(1)
 
             if train_state.step % job_config.training.val_interval  == 0:
                 val_loss = validate(
-                    job_config, model, data_loader_val, loss_fn, train_state.step,
+                    job_config, model, data_loaders_val, loss_fn, train_state.step,
                     dp_mesh=dp_mesh if parallel_dims.dp_enabled else None,
                 )
                 if global_rank == 0 and job_config.metrics.enable_wandb:
@@ -700,9 +770,16 @@ def main(job_config: JobConfig):
                             )
                     
     
-                
+
+                # gamma of every layer (collective under FSDP, so gathered on all ranks)
+                gamma_metrics = {}
+                if log_h_res:
+                    gamma_metrics = {
+                        f"gamma/{name}": gamma for name, (gamma, _) in collect_h_res(whole_model).items()
+                    }
+
                 if global_rank == 0  and job_config.metrics.enable_wandb:
-                    wandb.log({
+                    wandb_log_dict = {
                         "test": 1,
                         "step": train_state.step,
                         "loss": global_avg_loss,
@@ -714,16 +791,29 @@ def main(job_config: JobConfig):
                         "memory/max_reserved(%)": gpu_mem_stats.max_reserved_pct,
                         "wps": wps, # this is throughput tokens per second
                         "mfu": mfu,
-                        "total_time since last log (s)": time_end_to_end, 
+                        "total_time since last log (s)": time_end_to_end,
                         "total_token trained (B)": ntokens_total_train   / 1e9,
-                        },
-                        step = train_state.step)
-            
+                        **gamma_metrics,
+                    }
+                    wandb.log(wandb_log_dict, step=train_state.step)
+
                 losses_since_last_log.clear()
                 ntokens_since_last_log = 0
                 data_loading_times.clear()
                 time_last_log = timer()
                 gpu_memory_monitor.reset_peak_stats()
+
+            if h_res_save_dir is not None and train_state.step % job_config.model.save_h_res_freq == 0:
+                h_res = collect_h_res(whole_model)  # collective, all ranks
+                if global_rank == 0:
+                    torch.save(
+                        {
+                            "step": train_state.step,
+                            "gamma": {name: g for name, (g, _) in h_res.items()},
+                            "h_res": {name: m for name, (_, m) in h_res.items()},
+                        },
+                        os.path.join(h_res_save_dir, f"step-{train_state.step}.pt"),
+                    )
 
             checkpoint.save(
                 train_state.step, force=(train_state.step == job_config.training.steps)

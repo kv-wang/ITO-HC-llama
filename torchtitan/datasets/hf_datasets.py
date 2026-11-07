@@ -100,7 +100,10 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             # (we default to en)
             ds = load_dataset(dataset_path, name="en", split="train", streaming=True)
         elif dataset_name == "c4_mini":
-            ds = load_dataset(dataset_path, split="train")
+            # c4_mini is small (~100MB decoded), so load it fully into RAM instead of
+            # memory-mapping the Arrow cache, which lives on the network-mounted home
+            # dir and raises SIGBUS if that mount drops mid-run
+            ds = load_dataset(dataset_path, split="train", keep_in_memory=True)
         else:
             ds = load_dataset(dataset_path, split="train", streaming = True)
 
@@ -169,6 +172,35 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         return {"token_buffer": self._all_tokens, "sample_idx": self._sample_idx}
 
 
+class RoundRobinDataset(IterableDataset, Stateful):
+    """Interleaves the datasets of several data-parallel ranks in blocks of ``block_size`` samples.
+
+    With a DataLoader of batch_size = block_size, every batch is the next micro-batch of one
+    rank, cycling over the ranks. This lets one process feed the data of several ranks.
+    """
+
+    def __init__(self, datasets: List[HuggingFaceDataset], block_size: int) -> None:
+        self.datasets = datasets
+        self.block_size = block_size
+
+    def __iter__(self):
+        iterators = [iter(ds) for ds in self.datasets]
+        while True:
+            for it in iterators:
+                for _ in range(self.block_size):
+                    sample = next(it, None)
+                    if sample is None:
+                        return
+                    yield sample
+
+    def load_state_dict(self, state_dict):
+        for ds, ds_state in zip(self.datasets, state_dict["ranks"]):
+            ds.load_state_dict(ds_state)
+
+    def state_dict(self):
+        return {"ranks": [ds.state_dict() for ds in self.datasets]}
+
+
 class DPAwareDataLoader(StatefulDataLoader, Stateful):
     """
     A wrapper around the StatefulDataLoader that ensures that the state is stored only once per DP rank.
@@ -205,9 +237,19 @@ def build_hf_data_loader(
     world_size,
     rank,
     infinite: bool = True,
+    virtual_ranks: Optional[List[int]] = None,
 ):
-    hf_ds = HuggingFaceDataset(
-        dataset_name, dataset_path, tokenizer, seq_len, world_size, rank, infinite
-    )
+    """
+    ``virtual_ranks`` are the data-parallel ranks (out of ``world_size``) whose data this loader
+    yields, one micro-batch per rank in turn; defaults to ``[rank]``. ``rank`` is this process's
+    data-parallel rank, used to key the dataloader state.
+    """
+    datasets = [
+        HuggingFaceDataset(
+            dataset_name, dataset_path, tokenizer, seq_len, world_size, r, infinite
+        )
+        for r in (virtual_ranks or [rank])
+    ]
+    hf_ds = datasets[0] if len(datasets) == 1 else RoundRobinDataset(datasets, batch_size)
 
     return DPAwareDataLoader(rank, hf_ds, batch_size=batch_size)
